@@ -63,7 +63,7 @@ typedef struct _PML4_ENTRY_2MB
         } Fields;
     };
 } PML4_ENTRY_2MB, *PPML4_ENTRY_2MB,
-  PDP_ENTRY_2MB, *PPDP_ENTRY_2MB;
+  PDPT_ENTRY_2MB, *PPDPT_ENTRY_2MB;
 static_assert(sizeof(PML4_ENTRY_2MB) == 8,
               "PML4_ENTRY_1GB Size Mismatch");
 
@@ -167,12 +167,17 @@ static_assert(sizeof(SEGMENT_ATTRIBUTE) == 2,
 // SimpleSVM specific structures.
 //
 
+typedef struct _PML4E_TREE
+{
+    DECLSPEC_ALIGN(PAGE_SIZE) PDPT_ENTRY_2MB PdptEntries[512];
+    DECLSPEC_ALIGN(PAGE_SIZE) PD_ENTRY_2MB PdEntries[512][512];
+} PML4E_TREE, *PPML4E_TREE;
+
 typedef struct _SHARED_VIRTUAL_PROCESSOR_DATA
 {
     PVOID MsrPermissionsMap;
-    DECLSPEC_ALIGN(PAGE_SIZE) PML4_ENTRY_2MB Pml4Entries[1];    // Just for 512 GB
-    DECLSPEC_ALIGN(PAGE_SIZE) PDP_ENTRY_2MB PdpEntries[512];
-    DECLSPEC_ALIGN(PAGE_SIZE) PD_ENTRY_2MB PdeEntries[512][512];
+    DECLSPEC_ALIGN(PAGE_SIZE) PML4_ENTRY_2MB Pml4Entries[512];
+    DECLSPEC_ALIGN(PAGE_SIZE) PML4E_TREE Pml4eTrees[2];    // For 1TB
 } SHARED_VIRTUAL_PROCESSOR_DATA, *PSHARED_VIRTUAL_PROCESSOR_DATA;
 
 typedef struct _VIRTUAL_PROCESSOR_DATA
@@ -800,7 +805,7 @@ SvHandleVmExit (
         break;
     default:
         SV_DEBUG_BREAK();
-#pragma prefast(suppress : __WARNING_USE_OTHER_FUNCTION, "Unrecoverble path.")
+#pragma prefast(suppress : __WARNING_USE_OTHER_FUNCTION, "Unrecoverable path.")
         KeBugCheck(MANUALLY_INITIATED_CRASH);
     }
 
@@ -965,7 +970,7 @@ SvIsSimpleSvmHypervisorInstalled (
 }
 
 /*!
-    @brief      Virtualize the current processor.
+    @brief      Virtualizes the current processor.
 
     @details    This function enables SVM, initialize VMCB with the current
                 processor state, and enters the guest mode on the current
@@ -1511,7 +1516,7 @@ SvBuildMsrPermissionsMap (
 
                 In order to save memory to build nested page tables, 2MB large
                 pages are used (as opposed to the standard pages that describe
-                translation only for 4K granularity. Also, only up to 512 GB of
+                translation only for 4K granularity. Also, only up to 1 TB of
                 translation is built. 1GB huge pages are not used due to VMware
                 not supporting this feature.
 
@@ -1524,94 +1529,96 @@ SvBuildNestedPageTables (
     _Out_ PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData
     )
 {
-    ULONG64 pdpBasePa, pdeBasePa, translationPa;
+    ULONG64 pdptBasePa, pdBasePa, translationPa;
 
     //
-    // Build only one PML4 entry. This entry has subtables that control up to
-    // 512GB physical memory. PFN points to a base physical address of the page
+    // Build only two PML4 entries. Those entries have subtables that control up to
+    // 1 TB physical memory. PFN points to a base physical address of the page
     // directory pointer table.
     //
-    pdpBasePa = MmGetPhysicalAddress(&SharedVpData->PdpEntries).QuadPart;
-    SharedVpData->Pml4Entries[0].Fields.PageFrameNumber = pdpBasePa >> PAGE_SHIFT;
-
-    //
-    // The US (User) bit of all nested page table entries to be translated
-    // without #VMEXIT, as all guest accesses are treated as user accesses at
-    // the nested level. Also, the RW (Write) bit of nested page table entries
-    // that corresponds to guest page tables must be 1 since all guest page
-    // table accesses are threated as write access. See "Nested versus Guest
-    // Page Faults, Fault Ordering" for more details.
-    //
-    // Nested page tables built here set 1 to those bits for all entries, so
-    // that all translation can complete without triggering #VMEXIT. This does
-    // not lower security since security checks are done twice independently:
-    // based on guest page tables, and nested page tables. See "Nested versus
-    // Guest Page Faults, Fault Ordering" for more details.
-    //
-    SharedVpData->Pml4Entries[0].Fields.Valid = 1;
-    SharedVpData->Pml4Entries[0].Fields.Write = 1;
-    SharedVpData->Pml4Entries[0].Fields.User = 1;
-
-    //
-    // One PML4 entry controls 512 page directory pointer entires.
-    //
-    for (ULONG64 i = 0; i < 512; i++)
-    {
-        //
-        // PFN points to a base physical address of the page directory table.
-        //
-        pdeBasePa = MmGetPhysicalAddress(&SharedVpData->PdeEntries[i][0]).QuadPart;
-        SharedVpData->PdpEntries[i].Fields.PageFrameNumber = pdeBasePa >> PAGE_SHIFT;
-        SharedVpData->PdpEntries[i].Fields.Valid = 1;
-        SharedVpData->PdpEntries[i].Fields.Write = 1;
-        SharedVpData->PdpEntries[i].Fields.User = 1;
+    for (ULONG64 pml4Index = 0; pml4Index < 2; pml4Index++) {
+        PPML4_ENTRY_2MB pml4e = &SharedVpData->Pml4Entries[pml4Index];
+        PPML4E_TREE pml4eTree = &SharedVpData->Pml4eTrees[pml4Index];
 
         //
-        // One page directory entry controls 512 page directory entries.
+        // Set the US (User) bit of all nested page table entries to be translated
+        // without #VMEXIT, as all guest accesses are treated as user accesses at
+        // the nested level. Also, the RW (Write) bit of nested page table entries
+        // that corresponds to guest page tables must be 1 since all guest page
+        // table accesses are threated as write access. See "Nested versus Guest
+        // Page Faults, Fault Ordering" for more details.
         //
-        // We do not explicitly configure PAT in the NPT entry. The consequences
-        // of this are: 1) pages whose PAT (Page Attribute Table) type is the
-        // Write-Combining (WC) memory type could be treated as the
-        // Write-Combining Plus (WC+) while it should be WC when the MTRR type is
-        // either Write Protect (WP), Writethrough (WT) or Writeback (WB), and
-        // 2) pages whose PAT type is Uncacheable Minus (UC-) could be treated
-        // as Cache Disabled (CD) while it should be WC, when MTRR type is WC.
+        // Those settings do not lower security since permission checks are done
+        // twice independently: based on guest page tables, and nested page tables.
+        // See "Nested versus Guest Page Faults, Fault Ordering" for more details.
         //
-        // While those are not desirable, this is acceptable given that 1) only
-        // introduces additional cache snooping and associated performance
-        // penalty, which would not be significant since WC+ still lets
-        // processors combine multiple writes into one and avoid large
-        // performance penalty due to frequent writes to memory without caching.
-        // 2) might be worse but I have not seen MTRR ranges configured as WC
-        // on testing, hence the unintentional UC- will just results in the same
-        // effective memory type as what would be with UC.
+        pdptBasePa = MmGetPhysicalAddress(&pml4eTree->PdptEntries).QuadPart;
+        pml4e->Fields.PageFrameNumber = pdptBasePa >> PAGE_SHIFT;
+        pml4e->Fields.Valid = 1;
+        pml4e->Fields.Write = 1;
+        pml4e->Fields.User = 1;
+
         //
-        // See "Memory Types" (7.4), for details of memory types,
-        // "PAT-Register PA-Field Indexing", "Combining Guest and Host PAT Types",
-        // and "Combining PAT and MTRR Types" for how the effective memory type
-        // is determined based on Guest PAT type, Host PAT type, and the MTRR
-        // type.
+        // One PML4 entry controls 512 page directory pointer entires.
         //
-        // The correct approach may be to look up the guest PTE and copy the
-        // caching related bits (PAT, PCD, and PWT) when constructing NTP
-        // entries for non RAM regions, so the combined PAT will always be the
-        // same as the guest PAT type. This may be done when any issue manifests
-        // with the current implementation.
-        //
-        for (ULONG64 j = 0; j < 512; j++)
+        for (ULONG64 pdptIndex = 0; pdptIndex < 512; pdptIndex++)
         {
             //
-            // PFN points to a base physical address of system physical address
-            // to be translated from a guest physical address. Set the PS
-            // (LargePage) bit to indicate that this is a large page and no
-            // subtable exists.
+            // PFN points to a base physical address of the page directory table.
             //
-            translationPa = (i * 512) + j;
-            SharedVpData->PdeEntries[i][j].Fields.PageFrameNumber = translationPa;
-            SharedVpData->PdeEntries[i][j].Fields.Valid = 1;
-            SharedVpData->PdeEntries[i][j].Fields.Write = 1;
-            SharedVpData->PdeEntries[i][j].Fields.User = 1;
-            SharedVpData->PdeEntries[i][j].Fields.LargePage = 1;
+            pdBasePa = MmGetPhysicalAddress(&pml4eTree->PdEntries[pdptIndex][0]).QuadPart;
+            pml4eTree->PdptEntries[pdptIndex].Fields.PageFrameNumber = pdBasePa >> PAGE_SHIFT;
+            pml4eTree->PdptEntries[pdptIndex].Fields.Valid = 1;
+            pml4eTree->PdptEntries[pdptIndex].Fields.Write = 1;
+            pml4eTree->PdptEntries[pdptIndex].Fields.User = 1;
+
+            //
+            // One page directory entry controls 512 page directory entries.
+            //
+            // We do not explicitly configure PAT in the NPT entry. The consequences
+            // of this are: 1) pages whose PAT (Page Attribute Table) type is the
+            // Write-Combining (WC) memory type could be treated as the
+            // Write-Combining Plus (WC+) while it should be WC when the MTRR type is
+            // either Write Protect (WP), Writethrough (WT) or Writeback (WB), and
+            // 2) pages whose PAT type is Uncacheable Minus (UC-) could be treated
+            // as Cache Disabled (CD) while it should be WC, when MTRR type is WC.
+            //
+            // While those are not desirable, this is acceptable given that 1) only
+            // introduces additional cache snooping and associated performance
+            // penalty, which would not be significant since WC+ still lets
+            // processors combine multiple writes into one and avoid large
+            // performance penalty due to frequent writes to memory without caching.
+            // 2) might be worse but I have not seen MTRR ranges configured as WC
+            // on testing, hence the unintentional UC- will just results in the same
+            // effective memory type as what would be with UC.
+            //
+            // See "Memory Types" (7.4), for details of memory types,
+            // "PAT-Register PA-Field Indexing", "Combining Guest and Host PAT Types",
+            // and "Combining PAT and MTRR Types" for how the effective memory type
+            // is determined based on Guest PAT type, Host PAT type, and the MTRR
+            // type.
+            //
+            // The correct approach may be to look up the guest PTE and copy the
+            // caching related bits (PAT, PCD, and PWT) when constructing NTP
+            // entries for non RAM regions, so the combined PAT will always be the
+            // same as the guest PAT type. This may be done when any issue manifests
+            // with the current implementation.
+            //
+            for (ULONG64 pdIndex = 0; pdIndex < 512; pdIndex++)
+            {
+                //
+                // PFN points to a base physical address of system physical address
+                // to be translated from a guest physical address. Set the PS
+                // (LargePage) bit to indicate that this is a large page and no
+                // subtable exists.
+                //
+                translationPa = (pml4Index * 512 * 512) + (pdptIndex * 512) + pdIndex;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.PageFrameNumber = translationPa;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.Valid = 1;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.Write = 1;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.User = 1;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.LargePage = 1;
+            }
         }
     }
 }
